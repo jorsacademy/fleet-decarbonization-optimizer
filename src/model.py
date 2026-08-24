@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import ceil
 from typing import Dict, Tuple
 
 import pulp
@@ -41,20 +40,12 @@ def build_model(data: FleetData) -> ModelArtifacts:
     vehicle_ids = vehicles["ID"].tolist()
 
     vehicle = vehicles.set_index("ID").to_dict("index")
-    compatible_fuels = (
-        vehicle_fuels.groupby("ID")["Fuel"].apply(list).to_dict()
-    )
-    consumption = {
-        (row.ID, row.Fuel): float(getattr(row, "_2"))
-        for row in vehicle_fuels.itertuples(index=False, name=None)
-    }
+    compatible_fuels = vehicle_fuels.groupby("ID")["Fuel"].apply(list).to_dict()
 
-    # itertuples(name=None) above is awkward with spaces, so rebuild explicitly and safely.
     consumption = {
         (row["ID"], row["Fuel"]): float(row["Consumption (unit_fuel/km)"])
         for _, row in vehicle_fuels.iterrows()
     }
-
     fuel_cost = {
         (row["Fuel"], int(row["Year"])): float(row["Cost ($/unit_fuel)"])
         for _, row in fuels.iterrows()
@@ -78,11 +69,11 @@ def build_model(data: FleetData) -> ModelArtifacts:
 
     problem = pulp.LpProblem("Fleet_Decarbonization_Optimization", pulp.LpMinimize)
 
-    buy = {}
-    sell = {}
-    fleet = {}
-    used = {}
-    distance = {}
+    buy: Dict[Tuple[str, int], pulp.LpVariable] = {}
+    sell: Dict[Tuple[str, int], pulp.LpVariable] = {}
+    fleet: Dict[Tuple[str, int], pulp.LpVariable] = {}
+    used: Dict[Tuple[str, int, str, str], pulp.LpVariable] = {}
+    distance: Dict[Tuple[str, int, str, str], pulp.LpVariable] = {}
 
     for vid in vehicle_ids:
         model_year = int(vehicle[vid]["Year"])
@@ -104,9 +95,7 @@ def build_model(data: FleetData) -> ModelArtifacts:
     for vid in vehicle_ids:
         for i, year in enumerate(years):
             if i == 0:
-                problem += (
-                    fleet[(vid, year)] == buy[(vid, year)]
-                ), f"FleetBalanceStart__{vid}__{year}"
+                problem += fleet[(vid, year)] == buy[(vid, year)], f"FleetBalanceStart__{vid}__{year}"
             else:
                 prev = years[i - 1]
                 problem += (
@@ -116,54 +105,61 @@ def build_model(data: FleetData) -> ModelArtifacts:
 
             problem += sell[(vid, year)] <= fleet[(vid, year)], f"SellAvailable__{vid}__{year}"
 
-    # End-of-life: a vehicle bought in model year y may operate through y+9 and must be sold by end of y+9.
-    # Since every ID is tied to a single model/purchase year, the cohort is unique per ID.
+    # A vehicle bought in model year y may operate for 10 calendar years, through y+9.
+    # It must be sold at the end of that tenth year.
     for vid in vehicle_ids:
         model_year = int(vehicle[vid]["Year"])
         retirement_year = model_year + MAX_LIFE_YEARS - 1
+
         for year in years:
             if year > retirement_year:
                 problem += fleet[(vid, year)] == 0, f"LifeFleetZero__{vid}__{year}"
                 problem += sell[(vid, year)] == 0, f"LifeSellZero__{vid}__{year}"
+
         if retirement_year in years:
             problem += (
                 sell[(vid, retirement_year)] == fleet[(vid, retirement_year)]
             ), f"MandatoryRetirement__{vid}__{retirement_year}"
 
-    # Optional sales: at most 20% of fleet at year start, excluding vehicles that must retire at end of that year.
+    # Optional sales are capped at 20% of the existing fleet.
+    # Mandatory tenth-year retirements are excluded from the optional-sale cap.
     for year in years:
         optional_sell_terms = []
         eligible_fleet_terms = []
+
         for vid in vehicle_ids:
             model_year = int(vehicle[vid]["Year"])
             retirement_year = model_year + MAX_LIFE_YEARS - 1
             if year != retirement_year:
                 optional_sell_terms.append(sell[(vid, year)])
                 eligible_fleet_terms.append(fleet[(vid, year)])
+
         if eligible_fleet_terms:
             problem += (
                 pulp.lpSum(optional_sell_terms) <= 0.20 * pulp.lpSum(eligible_fleet_terms)
             ), f"MaxOptionalSales__{year}"
 
-    # Create assignment variables only for technically feasible vehicle/fuel/demand combinations.
-    demand_rows = []
+    # Assignment variables are created only for technically feasible combinations.
     for _, row in demand.iterrows():
         year = int(row["Year"])
         size = str(row["Size"])
         bucket = str(row["Distance"])
         demand_km = float(row["Demand (km)"])
-        demand_rows.append((year, size, bucket, demand_km))
 
         if bucket not in DISTANCE_RANK:
             raise ValueError(f"Unknown demand distance bucket: {bucket}")
 
         feasible_distance_vars = []
+
         for vid in vehicle_ids:
             if str(vehicle[vid]["Size"]) != size:
                 continue
+
             vehicle_bucket = str(vehicle[vid]["Distance"])
             if vehicle_bucket not in DISTANCE_RANK:
                 raise ValueError(f"Unknown vehicle distance bucket: {vehicle_bucket}")
+
+            # A D4 vehicle can serve D1-D4; a D3 vehicle can serve D1-D3, etc.
             if DISTANCE_RANK[vehicle_bucket] < DISTANCE_RANK[bucket]:
                 continue
 
@@ -177,10 +173,14 @@ def build_model(data: FleetData) -> ModelArtifacts:
 
                 key = (vid, year, bucket, fuel)
                 used[key] = pulp.LpVariable(
-                    f"Used__{vid}__{year}__{bucket}__{fuel}", lowBound=0, cat=pulp.LpInteger
+                    f"Used__{vid}__{year}__{bucket}__{fuel}",
+                    lowBound=0,
+                    cat=pulp.LpInteger,
                 )
                 distance[key] = pulp.LpVariable(
-                    f"Distance__{vid}__{year}__{bucket}__{fuel}", lowBound=0, cat=pulp.LpContinuous
+                    f"Distance__{vid}__{year}__{bucket}__{fuel}",
+                    lowBound=0,
+                    cat=pulp.LpContinuous,
                 )
 
                 yearly_range = float(vehicle[vid]["Yearly range (km)"])
@@ -192,7 +192,8 @@ def build_model(data: FleetData) -> ModelArtifacts:
 
         if not feasible_distance_vars:
             raise ValueError(
-                f"No feasible vehicle/fuel combination for demand row: year={year}, size={size}, bucket={bucket}"
+                "No feasible vehicle/fuel combination for demand row: "
+                f"year={year}, size={size}, bucket={bucket}"
             )
 
         problem += (
@@ -210,14 +211,13 @@ def build_model(data: FleetData) -> ModelArtifacts:
                     pulp.lpSum(matching_used) <= fleet[(vid, year)]
                 ), f"UseFleetLimit__{vid}__{year}"
 
-    # Annual carbon budget.
+    # Annual carbon budget: distance x consumption x fuel carbon intensity.
     for year in years:
         if year not in carbon_limit:
             raise ValueError(f"Missing carbon-emission limit for year {year}")
 
         emissions_terms = []
-        for key, dist_var in distance.items():
-            vid, y, _, fuel = key
+        for (vid, y, _, fuel), dist_var in distance.items():
             if y != year:
                 continue
             emissions_terms.append(
@@ -228,7 +228,7 @@ def build_model(data: FleetData) -> ModelArtifacts:
             pulp.lpSum(emissions_terms) <= carbon_limit[year]
         ), f"CarbonBudget__{year}"
 
-    # Objective: purchase + ownership + fuel - resale proceeds.
+    # Objective: purchase + insurance + maintenance + fuel - resale proceeds.
     objective_terms = []
 
     for vid in vehicle_ids:
@@ -242,18 +242,14 @@ def build_model(data: FleetData) -> ModelArtifacts:
             if 1 <= age <= MAX_LIFE_YEARS and age in cost_profile:
                 objective_terms.append(
                     purchase_cost
-                    * (
-                        cost_profile[age]["insurance"]
-                        + cost_profile[age]["maintenance"]
-                    )
+                    * (cost_profile[age]["insurance"] + cost_profile[age]["maintenance"])
                     * fleet[(vid, year)]
                 )
                 objective_terms.append(
                     -purchase_cost * cost_profile[age]["resale"] * sell[(vid, year)]
                 )
 
-    for key, dist_var in distance.items():
-        vid, year, _, fuel = key
+    for (vid, year, _, fuel), dist_var in distance.items():
         objective_terms.append(
             dist_var * consumption[(vid, fuel)] * fuel_cost[(fuel, year)]
         )
